@@ -9,4 +9,6 @@ async def sendKeyToBox(uidString):
         response = await websocket.recv()
         print(response)
 
-asyncio.run(sendKeyToBox('test nico'))
+#asyncio.run(sendKeyToBox('test nico'))
+loop = asyncio.get_event_loop()
+loop.run_until_complete(sendKeyToBox("Nico"))

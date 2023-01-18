@@ -66,4 +66,6 @@ async def sendKeyToBox(uidString):
         print(response)
 
 
-asyncio.run(ReadFromCardreader())
+#asyncio.run(ReadFromCardreader())
+loop = asyncio.get_event_loop()
+loop.run_until_complete(ReadFromCardreader())

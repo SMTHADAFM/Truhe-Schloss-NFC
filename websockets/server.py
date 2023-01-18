@@ -1,299 +1,295 @@
-from __future__ import annotations
+"""
+The :mod:`websockets.server` module defines a simple WebSocket server API.
 
-import base64
-import binascii
-import email.utils
-import http
-from typing import Generator, List, Optional, Sequence, Tuple, cast
+"""
 
-from .connection import CONNECTING, OPEN, SERVER, Connection, State
-from .datastructures import Headers, MultipleValuesError
+import asyncio
+import collections.abc
+import logging
+import sys
+
+from .compatibility import (
+    BAD_REQUEST, FORBIDDEN, INTERNAL_SERVER_ERROR, SERVICE_UNAVAILABLE,
+    SWITCHING_PROTOCOLS, UPGRADE_REQUIRED, asyncio_ensure_future
+)
 from .exceptions import (
-    InvalidHandshake,
-    InvalidHeader,
-    InvalidHeaderValue,
-    InvalidOrigin,
-    InvalidStatus,
-    InvalidUpgrade,
-    NegotiationError,
+    AbortHandshake, InvalidHandshake, InvalidMessage, InvalidOrigin,
+    InvalidUpgrade, NegotiationError
 )
-from .extensions import Extension, ServerExtensionFactory
+from .extensions.permessage_deflate import ServerPerMessageDeflateFactory
+from .handshake import build_response, check_request
 from .headers import (
-    build_extension,
-    parse_connection,
-    parse_extension,
-    parse_subprotocol,
-    parse_upgrade,
+    build_extension_list, parse_extension_list, parse_subprotocol_list
 )
-from .http11 import Request, Response
-from .typing import (
-    ConnectionOption,
-    ExtensionHeader,
-    LoggerLike,
-    Origin,
-    Subprotocol,
-    UpgradeProtocol,
-)
-from .utils import accept_key
+from .http import USER_AGENT, build_headers, read_request
+from .protocol import WebSocketCommonProtocol
 
 
-# See #940 for why lazy_import isn't used here for backwards compatibility.
-from .legacy.server import *  # isort:skip  # noqa
+__all__ = ['serve', 'unix_serve', 'WebSocketServerProtocol']
+
+logger = logging.getLogger(__name__)
 
 
-__all__ = ["ServerConnection"]
-
-
-class ServerConnection(Connection):
+class WebSocketServerProtocol(WebSocketCommonProtocol):
     """
-    Sans-I/O implementation of a WebSocket server connection.
+    Complete WebSocket server implementation as an :class:`asyncio.Protocol`.
 
-    Args:
-        origins: acceptable values of the ``Origin`` header; include
-            :obj:`None` in the list if the lack of an origin is acceptable.
-            This is useful for defending against Cross-Site WebSocket
-            Hijacking attacks.
-        extensions: list of supported extensions, in order in which they
-            should be tried.
-        subprotocols: list of supported subprotocols, in order of decreasing
-            preference.
-        state: initial state of the WebSocket connection.
-        max_size: maximum size of incoming messages in bytes;
-            :obj:`None` to disable the limit.
-        logger: logger for this connection;
-            defaults to ``logging.getLogger("websockets.client")``;
-            see the :doc:`logging guide <../topics/logging>` for details.
+    This class inherits most of its methods from
+    :class:`~websockets.protocol.WebSocketCommonProtocol`.
+
+    For the sake of simplicity, it doesn't rely on a full HTTP implementation.
+    Its support for HTTP responses is very limited.
 
     """
+    is_client = False
+    side = 'server'
 
-    def __init__(
-        self,
-        origins: Optional[Sequence[Optional[Origin]]] = None,
-        extensions: Optional[Sequence[ServerExtensionFactory]] = None,
-        subprotocols: Optional[Sequence[Subprotocol]] = None,
-        state: State = CONNECTING,
-        max_size: Optional[int] = 2**20,
-        logger: Optional[LoggerLike] = None,
-    ):
-        super().__init__(
-            side=SERVER,
-            state=state,
-            max_size=max_size,
-            logger=logger,
-        )
+    def __init__(self, ws_handler, ws_server, *,
+                 origins=None, extensions=None, subprotocols=None,
+                 extra_headers=None, **kwds):
+        self.ws_handler = ws_handler
+        self.ws_server = ws_server
         self.origins = origins
         self.available_extensions = extensions
         self.available_subprotocols = subprotocols
+        self.extra_headers = extra_headers
+        super().__init__(**kwds)
 
-    def accept(self, request: Request) -> Response:
+    def connection_made(self, transport):
         """
-        Create a handshake response to accept the connection.
+        Register connection and initialize a task to handle it.
 
-        If the connection cannot be established, the handshake response
-        actually rejects the handshake.
+        """
+        super().connection_made(transport)
+        # Register the connection with the server before creating the handler
+        # task. Registering at the beginning of the handler coroutine would
+        # create a race condition between the creation of the task, which
+        # schedules its execution, and the moment the handler starts running.
+        self.ws_server.register(self)
+        self.handler_task = asyncio_ensure_future(
+            self.handler(), loop=self.loop)
 
-        You must send the handshake response with :meth:`send_response`.
+    @asyncio.coroutine
+    def handler(self):
+        """
+        Handle the lifecycle of a WebSocket connection.
 
-        You can modify it before sending it, for example to add HTTP headers.
-
-        Args:
-            request: WebSocket handshake request event received from the client.
-
-        Returns:
-            Response: WebSocket handshake response event to send to the client.
+        Since this method doesn't have a caller able to handle exceptions, it
+        attemps to log relevant ones and close the connection properly.
 
         """
         try:
-            (
-                accept_header,
-                extensions_header,
-                protocol_header,
-            ) = self.process_request(request)
-        except InvalidOrigin as exc:
-            request._exception = exc
-            self.handshake_exc = exc
-            if self.debug:
-                self.logger.debug("! invalid origin", exc_info=True)
-            return self.reject(
-                http.HTTPStatus.FORBIDDEN,
-                f"Failed to open a WebSocket connection: {exc}.\n",
-            )
-        except InvalidUpgrade as exc:
-            request._exception = exc
-            self.handshake_exc = exc
-            if self.debug:
-                self.logger.debug("! invalid upgrade", exc_info=True)
-            response = self.reject(
-                http.HTTPStatus.UPGRADE_REQUIRED,
-                (
-                    f"Failed to open a WebSocket connection: {exc}.\n"
-                    f"\n"
-                    f"You cannot access a WebSocket server directly "
-                    f"with a browser. You need a WebSocket client.\n"
-                ),
-            )
-            response.headers["Upgrade"] = "websocket"
-            return response
-        except InvalidHandshake as exc:
-            request._exception = exc
-            self.handshake_exc = exc
-            if self.debug:
-                self.logger.debug("! invalid handshake", exc_info=True)
-            return self.reject(
-                http.HTTPStatus.BAD_REQUEST,
-                f"Failed to open a WebSocket connection: {exc}.\n",
-            )
-        except Exception as exc:
-            request._exception = exc
-            self.handshake_exc = exc
-            self.logger.error("opening handshake failed", exc_info=True)
-            return self.reject(
-                http.HTTPStatus.INTERNAL_SERVER_ERROR,
-                (
-                    "Failed to open a WebSocket connection.\n"
-                    "See server log for more information.\n"
-                ),
-            )
 
-        headers = Headers()
+            try:
+                path = yield from self.handshake(
+                    origins=self.origins,
+                    available_extensions=self.available_extensions,
+                    available_subprotocols=self.available_subprotocols,
+                    extra_headers=self.extra_headers,
+                )
+            except ConnectionError as exc:
+                logger.debug(
+                    "Connection error in opening handshake", exc_info=True)
+                raise
+            except Exception as exc:
+                if self._is_server_shutting_down(exc):
+                    early_response = (
+                        SERVICE_UNAVAILABLE,
+                        [],
+                        b"Server is shutting down.\n",
+                    )
+                elif isinstance(exc, AbortHandshake):
+                    early_response = (
+                        exc.status,
+                        exc.headers,
+                        exc.body,
+                    )
+                elif isinstance(exc, InvalidOrigin):
+                    logger.debug("Invalid origin", exc_info=True)
+                    early_response = (
+                        FORBIDDEN,
+                        [],
+                        (str(exc) + "\n").encode(),
+                    )
+                elif isinstance(exc, InvalidUpgrade):
+                    logger.debug("Invalid upgrade", exc_info=True)
+                    early_response = (
+                        UPGRADE_REQUIRED,
+                        [('Upgrade', 'websocket')],
+                        (str(exc) + "\n").encode(),
+                    )
+                elif isinstance(exc, InvalidHandshake):
+                    logger.debug("Invalid handshake", exc_info=True)
+                    early_response = (
+                        BAD_REQUEST,
+                        [],
+                        (str(exc) + "\n").encode(),
+                    )
+                else:
+                    logger.warning("Error in opening handshake", exc_info=True)
+                    early_response = (
+                        INTERNAL_SERVER_ERROR,
+                        [],
+                        b"See server log for more information.\n",
+                    )
 
-        headers["Date"] = email.utils.formatdate(usegmt=True)
+                yield from self.write_http_response(*early_response)
+                yield from self.fail_connection()
 
-        headers["Upgrade"] = "websocket"
-        headers["Connection"] = "Upgrade"
-        headers["Sec-WebSocket-Accept"] = accept_header
+                return
 
-        if extensions_header is not None:
-            headers["Sec-WebSocket-Extensions"] = extensions_header
+            try:
+                yield from self.ws_handler(self, path)
+            except Exception as exc:
+                if self._is_server_shutting_down(exc):
+                    if not self.closed:
+                        self.fail_connection(1001)
+                else:
+                    logger.error("Error in connection handler", exc_info=True)
+                    if not self.closed:
+                        self.fail_connection(1011)
+                raise
 
-        if protocol_header is not None:
-            headers["Sec-WebSocket-Protocol"] = protocol_header
+            try:
+                yield from self.close()
+            except ConnectionError as exc:
+                logger.debug(
+                    "Connection error in closing handshake", exc_info=True)
+                raise
+            except Exception as exc:
+                if not self._is_server_shutting_down(exc):
+                    logger.warning("Error in closing handshake", exc_info=True)
+                raise
 
-        self.logger.info("connection open")
-        return Response(101, "Switching Protocols", headers)
+        except Exception:
+            # Last-ditch attempt to avoid leaking connections on errors.
+            try:
+                self.writer.close()
+            except Exception:                               # pragma: no cover
+                pass
 
-    def process_request(
-        self, request: Request
-    ) -> Tuple[str, Optional[str], Optional[str]]:
+        finally:
+            # Unregister the connection with the server when the handler task
+            # terminates. Registration is tied to the lifecycle of the handler
+            # task because the server waits for tasks attached to registered
+            # connections before terminating.
+            self.ws_server.unregister(self)
+
+    def _is_server_shutting_down(self, exc):
         """
-        Check a handshake request and negotiate extensions and subprotocol.
-
-        This function doesn't verify that the request is an HTTP/1.1 or higher
-        GET request and doesn't check the ``Host`` header. These controls are
-        usually performed earlier in the HTTP request handling code. They're
-        the responsibility of the caller.
-
-        Args:
-            request: WebSocket handshake request received from the client.
-
-        Returns:
-            Tuple[str, Optional[str], Optional[str]]:
-            ``Sec-WebSocket-Accept``, ``Sec-WebSocket-Extensions``, and
-            ``Sec-WebSocket-Protocol`` headers for the handshake response.
-
-        Raises:
-            InvalidHandshake: if the handshake request is invalid;
-                then the server must return 400 Bad Request error.
+        Decide whether an exception means that the server is shutting down.
 
         """
-        headers = request.headers
-
-        connection: List[ConnectionOption] = sum(
-            [parse_connection(value) for value in headers.get_all("Connection")], []
-        )
-
-        if not any(value.lower() == "upgrade" for value in connection):
-            raise InvalidUpgrade(
-                "Connection", ", ".join(connection) if connection else None
-            )
-
-        upgrade: List[UpgradeProtocol] = sum(
-            [parse_upgrade(value) for value in headers.get_all("Upgrade")], []
-        )
-
-        # For compatibility with non-strict implementations, ignore case when
-        # checking the Upgrade header. The RFC always uses "websocket", except
-        # in section 11.2. (IANA registration) where it uses "WebSocket".
-        if not (len(upgrade) == 1 and upgrade[0].lower() == "websocket"):
-            raise InvalidUpgrade("Upgrade", ", ".join(upgrade) if upgrade else None)
-
-        try:
-            key = headers["Sec-WebSocket-Key"]
-        except KeyError as exc:
-            raise InvalidHeader("Sec-WebSocket-Key") from exc
-        except MultipleValuesError as exc:
-            raise InvalidHeader(
-                "Sec-WebSocket-Key", "more than one Sec-WebSocket-Key header found"
-            ) from exc
-
-        try:
-            raw_key = base64.b64decode(key.encode(), validate=True)
-        except binascii.Error as exc:
-            raise InvalidHeaderValue("Sec-WebSocket-Key", key) from exc
-        if len(raw_key) != 16:
-            raise InvalidHeaderValue("Sec-WebSocket-Key", key)
-
-        try:
-            version = headers["Sec-WebSocket-Version"]
-        except KeyError as exc:
-            raise InvalidHeader("Sec-WebSocket-Version") from exc
-        except MultipleValuesError as exc:
-            raise InvalidHeader(
-                "Sec-WebSocket-Version",
-                "more than one Sec-WebSocket-Version header found",
-            ) from exc
-
-        if version != "13":
-            raise InvalidHeaderValue("Sec-WebSocket-Version", version)
-
-        accept_header = accept_key(key)
-
-        self.origin = self.process_origin(headers)
-
-        extensions_header, self.extensions = self.process_extensions(headers)
-
-        protocol_header = self.subprotocol = self.process_subprotocol(headers)
-
         return (
-            accept_header,
-            extensions_header,
-            protocol_header,
+            isinstance(exc, asyncio.CancelledError) and
+            self.ws_server.closing
         )
 
-    def process_origin(self, headers: Headers) -> Optional[Origin]:
+    @asyncio.coroutine
+    def read_http_request(self):
+        """
+        Read request line and headers from the HTTP request.
+
+        Raise :exc:`~websockets.exceptions.InvalidMessage` if the HTTP message
+        is malformed or isn't an HTTP/1.1 GET request.
+
+        Don't attempt to read the request body because WebSocket handshake
+        requests don't have one. If the request contains a body, it may be
+        read from ``self.reader`` after this coroutine returns.
+
+        """
+        try:
+            path, headers = yield from read_request(self.reader)
+        except ValueError as exc:
+            raise InvalidMessage("Malformed HTTP message") from exc
+
+        self.path = path
+        self.request_headers = build_headers(headers)
+        self.raw_request_headers = headers
+
+        return path, self.request_headers
+
+    @asyncio.coroutine
+    def write_http_response(self, status, headers, body=None):
+        """
+        Write status line and headers to the HTTP response.
+
+        This coroutine is also able to write a response body.
+
+        """
+        self.response_headers = build_headers(headers)
+        self.raw_response_headers = headers
+
+        # Since the status line and headers only contain ASCII characters,
+        # we can keep this simple.
+        response = [
+            'HTTP/1.1 {value} {phrase}'.format(
+                value=status.value, phrase=status.phrase)]
+        response.extend('{}: {}'.format(k, v) for k, v in headers)
+        response.append('\r\n')
+        response = '\r\n'.join(response).encode()
+
+        self.writer.write(response)
+
+        if body is not None:
+            self.writer.write(body)
+
+    @asyncio.coroutine
+    def process_request(self, path, request_headers):
+        """
+        Intercept the HTTP request and return an HTTP response if needed.
+
+        ``request_headers`` are a :class:`~http.client.HTTPMessage`.
+
+        If this coroutine returns ``None``, the WebSocket handshake continues.
+        If it returns a status code, headers and a optionally a response body,
+        that HTTP response is sent and the connection is closed.
+
+        The HTTP status must be a :class:`~http.HTTPStatus`. HTTP headers must
+        be an iterable of ``(name, value)`` pairs. If provided, the HTTP
+        response body must be :class:`bytes`.
+
+        (:class:`~http.HTTPStatus` was added in Python 3.5. Use a compatible
+        object on earlier versions. Look at ``SWITCHING_PROTOCOLS`` in
+        ``websockets.compatibility`` for an example.)
+
+        This method may be overridden to check the request headers and set a
+        different status, for example to authenticate the request and return
+        ``HTTPStatus.UNAUTHORIZED`` or ``HTTPStatus.FORBIDDEN``.
+
+        It is declared as a coroutine because such authentication checks are
+        likely to require network requests.
+
+        """
+
+    def process_origin(self, get_header, origins=None):
         """
         Handle the Origin HTTP request header.
 
-        Args:
-            headers: WebSocket handshake request headers.
-
-        Returns:
-           Optional[Origin]: origin, if it is acceptable.
-
-        Raises:
-            InvalidOrigin: if the origin isn't acceptable.
+        Raise :exc:`~websockets.exceptions.InvalidOrigin` if the origin isn't
+        acceptable.
 
         """
-        # "The user agent MUST NOT include more than one Origin header field"
-        # per https://www.rfc-editor.org/rfc/rfc6454.html#section-7.3.
-        try:
-            origin = cast(Optional[Origin], headers.get("Origin"))
-        except MultipleValuesError as exc:
-            raise InvalidHeader("Origin", "more than one Origin header found") from exc
-        if self.origins is not None:
-            if origin not in self.origins:
+        origin = get_header('Origin')
+        if origins is not None:
+            if origin not in origins:
                 raise InvalidOrigin(origin)
         return origin
 
-    def process_extensions(
-        self,
-        headers: Headers,
-    ) -> Tuple[Optional[str], List[Extension]]:
+    @staticmethod
+    def process_extensions(headers, available_extensions):
         """
         Handle the Sec-WebSocket-Extensions HTTP request header.
 
         Accept or reject each extension proposed in the client request.
         Negotiate parameters for accepted extensions.
+
+        Return the Sec-WebSocket-Extensions HTTP response header and the list
+        of accepted extensions.
+
+        Raise :exc:`~websockets.exceptions.InvalidHandshake` to abort the
+        handshake with an HTTP 400 error code. (The default implementation
+        never does this.)
 
         :rfc:`6455` leaves the rules up to the specification of each
         :extension.
@@ -303,7 +299,7 @@ class ServerConnection(Connection):
         server configuration. If no match is found, the extension is ignored.
 
         If several variants of the same extension are proposed by the client,
-        it may be accepted several times, which won't make sense in general.
+        it may be accepted severel times, which won't make sense in general.
         Extensions must implement their own requirements. For this purpose,
         the list of previously accepted extensions is provided.
 
@@ -313,48 +309,37 @@ class ServerConnection(Connection):
         Other requirements, for example related to mandatory extensions or the
         order of extensions, may be implemented by overriding this method.
 
-        Args:
-            headers: WebSocket handshake request headers.
-
-        Returns:
-            Tuple[Optional[str], List[Extension]]: ``Sec-WebSocket-Extensions``
-            HTTP response header and list of accepted extensions.
-
-        Raises:
-            InvalidHandshake: to abort the handshake with an HTTP 400 error.
-
         """
-        response_header_value: Optional[str] = None
+        response_header = []
+        accepted_extensions = []
 
-        extension_headers: List[ExtensionHeader] = []
-        accepted_extensions: List[Extension] = []
+        header_values = headers.get_all('Sec-WebSocket-Extensions')
 
-        header_values = headers.get_all("Sec-WebSocket-Extensions")
+        if header_values is not None and available_extensions is not None:
 
-        if header_values and self.available_extensions:
-
-            parsed_header_values: List[ExtensionHeader] = sum(
-                [parse_extension(header_value) for header_value in header_values], []
-            )
+            parsed_header_values = sum([
+                parse_extension_list(header_value)
+                for header_value in header_values
+            ], [])
 
             for name, request_params in parsed_header_values:
 
-                for ext_factory in self.available_extensions:
+                for extension_factory in available_extensions:
 
                     # Skip non-matching extensions based on their name.
-                    if ext_factory.name != name:
+                    if extension_factory.name != name:
                         continue
 
                     # Skip non-matching extensions based on their params.
                     try:
-                        response_params, extension = ext_factory.process_request_params(
-                            request_params, accepted_extensions
-                        )
+                        response_params, extension = (
+                            extension_factory.process_request_params(
+                                request_params, accepted_extensions))
                     except NegotiationError:
                         continue
 
                     # Add matching extension to the final list.
-                    extension_headers.append((name, response_params))
+                    response_header.append((name, response_params))
                     accepted_extensions.append(extension)
 
                     # Break out of the loop once we have a match.
@@ -364,47 +349,42 @@ class ServerConnection(Connection):
                 # matched what the client sent. The extension is declined.
 
         # Serialize extension header.
-        if extension_headers:
-            response_header_value = build_extension(extension_headers)
+        if response_header:
+            response_header = build_extension_list(response_header)
+        else:
+            response_header = None
 
-        return response_header_value, accepted_extensions
+        return response_header, accepted_extensions
 
-    def process_subprotocol(self, headers: Headers) -> Optional[Subprotocol]:
+    # Not @staticmethod because it calls self.select_subprotocol()
+    def process_subprotocol(self, headers, available_subprotocols):
         """
         Handle the Sec-WebSocket-Protocol HTTP request header.
 
-        Args:
-            headers: WebSocket handshake request headers.
-
-        Returns:
-           Optional[Subprotocol]: Subprotocol, if one was selected; this is
-           also the value of the ``Sec-WebSocket-Protocol`` response header.
-
-        Raises:
-            InvalidHandshake: to abort the handshake with an HTTP 400 error.
+        Return Sec-WebSocket-Protocol HTTP response header, which is the same
+        as the selected subprotocol.
 
         """
-        subprotocol: Optional[Subprotocol] = None
+        subprotocol = None
 
-        header_values = headers.get_all("Sec-WebSocket-Protocol")
+        header_values = headers.get_all('Sec-WebSocket-Protocol')
 
-        if header_values and self.available_subprotocols:
+        if header_values is not None and available_subprotocols is not None:
 
-            parsed_header_values: List[Subprotocol] = sum(
-                [parse_subprotocol(header_value) for header_value in header_values], []
-            )
+            parsed_header_values = sum([
+                parse_subprotocol_list(header_value)
+                for header_value in header_values
+            ], [])
 
             subprotocol = self.select_subprotocol(
-                parsed_header_values, self.available_subprotocols
+                parsed_header_values,
+                available_subprotocols,
             )
 
         return subprotocol
 
-    def select_subprotocol(
-        self,
-        client_subprotocols: Sequence[Subprotocol],
-        server_subprotocols: Sequence[Subprotocol],
-    ) -> Optional[Subprotocol]:
+    @staticmethod
+    def select_subprotocol(client_subprotocols, server_subprotocols):
         """
         Pick a subprotocol among those offered by the client.
 
@@ -412,106 +392,383 @@ class ServerConnection(Connection):
         the default implementation selects the preferred subprotocols by
         giving equal value to the priorities of the client and the server.
 
-        If no common subprotocol is supported by the client and the server, it
+        If no subprotocols are supported by the client and the server, it
         proceeds without a subprotocol.
 
         This is unlikely to be the most useful implementation in practice, as
         many servers providing a subprotocol will require that the client uses
-        that subprotocol.
-
-        Args:
-            client_subprotocols: list of subprotocols offered by the client.
-            server_subprotocols: list of subprotocols available on the server.
-
-        Returns:
-            Optional[Subprotocol]: Subprotocol, if a common subprotocol was
-            found.
+        that subprotocol. Such rules can be implemented in a subclass.
 
         """
         subprotocols = set(client_subprotocols) & set(server_subprotocols)
         if not subprotocols:
             return None
         priority = lambda p: (
-            client_subprotocols.index(p) + server_subprotocols.index(p)
-        )
+            client_subprotocols.index(p) + server_subprotocols.index(p))
         return sorted(subprotocols, key=priority)[0]
 
-    def reject(
-        self,
-        status: http.HTTPStatus,
-        text: str,
-    ) -> Response:
+    @asyncio.coroutine
+    def handshake(self, origins=None, available_extensions=None,
+                  available_subprotocols=None, extra_headers=None):
         """
-        Create a handshake response to reject the connection.
+        Perform the server side of the opening handshake.
 
-        A short plain text response is the best fallback when failing to
-        establish a WebSocket connection.
+        If provided, ``origins`` is a list of acceptable HTTP Origin values.
+        Include ``''`` if the lack of an origin is acceptable.
 
-        You must send the handshake response with :meth:`send_response`.
+        If provided, ``available_extensions`` is a list of supported
+        extensions in the order in which they should be used.
 
-        You can modify it before sending it, for example to alter HTTP headers.
+        If provided, ``available_subprotocols`` is a list of supported
+        subprotocols in order of decreasing preference.
 
-        Args:
-            status: HTTP status code.
-            text: HTTP response body; will be encoded to UTF-8.
+        If provided, ``extra_headers`` sets additional HTTP response headers.
+        It can be a mapping or an iterable of (name, value) pairs. It can also
+        be a callable taking the request path and headers in arguments.
 
-        Returns:
-            Response: WebSocket handshake response event to send to the client.
+        Raise :exc:`~websockets.exceptions.InvalidHandshake` if the handshake
+        fails.
+
+        Return the path of the URI of the request.
 
         """
-        body = text.encode()
-        headers = Headers(
-            [
-                ("Date", email.utils.formatdate(usegmt=True)),
-                ("Connection", "close"),
-                ("Content-Length", str(len(body))),
-                ("Content-Type", "text/plain; charset=utf-8"),
-            ]
+        path, request_headers = yield from self.read_http_request()
+
+        # Hook for customizing request handling, for example checking
+        # authentication or treating some paths as plain HTTP endpoints.
+
+        early_response = yield from self.process_request(path, request_headers)
+        if early_response is not None:
+            raise AbortHandshake(*early_response)
+
+        get_header = lambda k: request_headers.get(k, '')
+
+        key = check_request(get_header)
+
+        self.origin = self.process_origin(get_header, origins)
+
+        extensions_header, self.extensions = self.process_extensions(
+            request_headers, available_extensions)
+
+        protocol_header = self.subprotocol = self.process_subprotocol(
+            request_headers, available_subprotocols)
+
+        response_headers = []
+        set_header = lambda k, v: response_headers.append((k, v))
+        is_header_set = lambda k: k in dict(response_headers).keys()
+
+        if extensions_header is not None:
+            set_header('Sec-WebSocket-Extensions', extensions_header)
+
+        if self.subprotocol is not None:
+            set_header('Sec-WebSocket-Protocol', protocol_header)
+
+        if extra_headers is not None:
+            if callable(extra_headers):
+                extra_headers = extra_headers(path, self.raw_request_headers)
+            if isinstance(extra_headers, collections.abc.Mapping):
+                extra_headers = extra_headers.items()
+            for name, value in extra_headers:
+                set_header(name, value)
+
+        if not is_header_set('Server'):
+            set_header('Server', USER_AGENT)
+
+        build_response(set_header, key)
+
+        yield from self.write_http_response(
+            SWITCHING_PROTOCOLS, response_headers)
+
+        self.connection_open()
+
+        return path
+
+
+class WebSocketServer:
+    """
+    Wrapper for :class:`~asyncio.Server` that closes connections on exit.
+
+    This class provides the return type of :func:`~websockets.server.serve`.
+
+    It mimics the interface of :class:`~asyncio.AbstractServer`, namely its
+    :meth:`~asyncio.AbstractServer.close()` and
+    :meth:`~asyncio.AbstractServer.wait_closed()` methods, to close WebSocket
+    connections properly on exit, in addition to closing the underlying
+    :class:`~asyncio.Server`.
+
+    Instances of this class store a reference to the :class:`~asyncio.Server`
+    object returned by :meth:`~asyncio.AbstractEventLoop.create_server` rather
+    than inherit from :class:`~asyncio.Server` in part because
+    :meth:`~asyncio.AbstractEventLoop.create_server` doesn't support passing a
+    custom :class:`~asyncio.Server` class.
+
+    """
+    def __init__(self, loop):
+        # Store a reference to loop to avoid relying on self.server._loop.
+        self.loop = loop
+
+        self.closing = False
+        self.websockets = set()
+
+    def wrap(self, server):
+        """
+        Attach to a given :class:`~asyncio.Server`.
+
+        Since :meth:`~asyncio.AbstractEventLoop.create_server` doesn't support
+        injecting a custom ``Server`` class, the easiest solution that doesn't
+        rely on private :mod:`asyncio` APIs is to:
+
+        - instantiate a :class:`WebSocketServer`
+        - give the protocol factory a reference to that instance
+        - call :meth:`~asyncio.AbstractEventLoop.create_server` with the
+          factory
+        - attach the resulting :class:`~asyncio.Server` with this method
+
+        """
+        self.server = server
+
+    def register(self, protocol):
+        """
+        Register a connection with this server.
+
+        """
+        self.websockets.add(protocol)
+
+    def unregister(self, protocol):
+        """
+        Unregister a connection with this server.
+
+        """
+        self.websockets.remove(protocol)
+
+    def close(self):
+        """
+        Close the underlying server, and clean up connections.
+
+        This calls :meth:`~asyncio.Server.close` on the underlying
+        :class:`~asyncio.Server` object, closes open connections with
+        status code 1001, and stops accepting new connections.
+
+        """
+        # Make a note that the server is shutting down. Websocket connections
+        # check this attribute to decide to send a "going away" close code.
+        self.closing = True
+
+        # Stop accepting new connections.
+        self.server.close()
+
+        # Close open connections. For each connection, two tasks are running:
+        # 1. self.transfer_data_task receives incoming WebSocket messages
+        # 2. self.handler_task runs the opening handshake, the handler provided
+        #    by the user and the closing handshake
+        # In the general case, cancelling the handler task will cause the
+        # handler provided by the user to exit with a CancelledError, which
+        # will then cause the transfer data task to terminate.
+        for websocket in self.websockets:
+            websocket.handler_task.cancel()
+
+    @asyncio.coroutine
+    def wait_closed(self):
+        """
+        Wait until the underlying server and all connections are closed.
+
+        This calls :meth:`~asyncio.Server.wait_closed` on the underlying
+        :class:`~asyncio.Server` object and waits until closing handshakes
+        are complete and all connections are closed.
+
+        This method must be called after :meth:`close()`.
+
+        """
+        # asyncio.wait doesn't accept an empty first argument.
+        if self.websockets:
+            # Either the handler or the connection can terminate first,
+            # depending on how the client behaves and the server is
+            # implemented.
+            yield from asyncio.wait(
+                [websocket.handler_task for websocket in self.websockets] +
+                [websocket.close_connection_task
+                    for websocket in self.websockets],
+                loop=self.loop)
+        yield from self.server.wait_closed()
+
+    @property
+    def sockets(self):
+        """
+        List of :class:`~socket.socket` objects the server is listening to.
+
+        ``None`` if the server is closed.
+
+        """
+        return self.server.sockets
+
+
+class Serve:
+    """
+    Create, start, and return a :class:`WebSocketServer`.
+
+    :func:`serve` returns an awaitable. Awaiting it yields an instance of
+    :class:`WebSocketServer` which provides
+    :meth:`~websockets.server.WebSocketServer.close` and
+    :meth:`~websockets.server.WebSocketServer.wait_closed` methods for
+    terminating the server and cleaning up its resources.
+
+    On Python ≥ 3.5, :func:`serve` can also be used as an asynchronous context
+    manager. In this case, the server is shut down when exiting the context.
+
+    :func:`serve` is a wrapper around the event loop's
+    :meth:`~asyncio.AbstractEventLoop.create_server` method. Internally, it
+    creates and starts a :class:`~asyncio.Server` object by calling
+    :meth:`~asyncio.AbstractEventLoop.create_server`. The
+    :class:`WebSocketServer` it returns keeps a reference to this object.
+
+    The ``ws_handler`` argument is the WebSocket handler. It must be a
+    coroutine accepting two arguments: a :class:`WebSocketServerProtocol` and
+    the request URI.
+
+    The ``host`` and ``port`` arguments, as well as unrecognized keyword
+    arguments, are passed along to
+    :meth:`~asyncio.AbstractEventLoop.create_server`. For example, you can set
+    the ``ssl`` keyword argument to a :class:`~ssl.SSLContext` to enable TLS.
+
+    The ``create_protocol`` parameter allows customizing the asyncio protocol
+    that manages the connection. It should be a callable or class accepting
+    the same arguments as :class:`WebSocketServerProtocol` and returning a
+    :class:`WebSocketServerProtocol` instance. It defaults to
+    :class:`WebSocketServerProtocol`.
+
+    The behavior of the ``timeout``, ``max_size``, and ``max_queue``,
+    ``read_limit``, and ``write_limit`` optional arguments is described in the
+    documentation of :class:`~websockets.protocol.WebSocketCommonProtocol`.
+
+    :func:`serve` also accepts the following optional arguments:
+
+    * ``origins`` defines acceptable Origin HTTP headers — include ``''`` if
+      the lack of an origin is acceptable
+    * ``extensions`` is a list of supported extensions in order of
+      decreasing preference
+    * ``subprotocols`` is a list of supported subprotocols in order of
+      decreasing preference
+    * ``extra_headers`` sets additional HTTP response headers — it can be a
+      mapping, an iterable of (name, value) pairs, or a callable taking the
+      request path and headers in arguments.
+    * ``compression`` is a shortcut to configure compression extensions;
+      by default it enables the "permessage-deflate" extension; set it to
+      ``None`` to disable compression
+
+    Whenever a client connects, the server accepts the connection, creates a
+    :class:`WebSocketServerProtocol`, performs the opening handshake, and
+    delegates to the WebSocket handler. Once the handler completes, the server
+    performs the closing handshake and closes the connection.
+
+    When a server is closed with
+    :meth:`~websockets.server.WebSocketServer.close`, all running WebSocket
+    handlers are cancelled. They may intercept :exc:`~asyncio.CancelledError`
+    and perform cleanup actions before re-raising that exception. If a handler
+    started new tasks, it should cancel them as well in that case.
+
+    Since there's no useful way to propagate exceptions triggered in handlers,
+    they're sent to the ``'websockets.server'`` logger instead. Debugging is
+    much easier if you configure logging to print them::
+
+        import logging
+        logger = logging.getLogger('websockets.server')
+        logger.setLevel(logging.ERROR)
+        logger.addHandler(logging.StreamHandler())
+
+    """
+
+    def __init__(self, ws_handler, host=None, port=None, *,
+                 path=None, create_protocol=None,
+                 timeout=10, max_size=2 ** 20, max_queue=2 ** 5,
+                 read_limit=2 ** 16, write_limit=2 ** 16,
+                 loop=None, legacy_recv=False, klass=None,
+                 origins=None, extensions=None, subprotocols=None,
+                 extra_headers=None, compression='deflate', **kwds):
+        # Backwards-compatibility: create_protocol used to be called klass.
+        # In the unlikely event that both are specified, klass is ignored.
+        if create_protocol is None:
+            create_protocol = klass
+
+        if create_protocol is None:
+            create_protocol = WebSocketServerProtocol
+
+        if loop is None:
+            loop = asyncio.get_event_loop()
+
+        ws_server = WebSocketServer(loop)
+
+        secure = kwds.get('ssl') is not None
+
+        if compression == 'deflate':
+            if extensions is None:
+                extensions = []
+            if not any(
+                extension_factory.name == ServerPerMessageDeflateFactory.name
+                for extension_factory in extensions
+            ):
+                extensions.append(ServerPerMessageDeflateFactory())
+        elif compression is not None:
+            raise ValueError("Unsupported compression: {}".format(compression))
+
+        factory = lambda: create_protocol(
+            ws_handler, ws_server,
+            host=host, port=port, secure=secure,
+            timeout=timeout, max_size=max_size, max_queue=max_queue,
+            read_limit=read_limit, write_limit=write_limit,
+            loop=loop, legacy_recv=legacy_recv,
+            origins=origins, extensions=extensions, subprotocols=subprotocols,
+            extra_headers=extra_headers,
         )
-        response = Response(status.value, status.phrase, headers, body)
-        # When reject() is called from accept(), handshake_exc is already set.
-        # If a user calls reject(), set handshake_exc to guarantee invariant:
-        # "handshake_exc is None if and only if opening handshake succeded."
-        if self.handshake_exc is None:
-            self.handshake_exc = InvalidStatus(response)
-        self.logger.info("connection failed (%d %s)", status.value, status.phrase)
-        return response
 
-    def send_response(self, response: Response) -> None:
-        """
-        Send a handshake response to the client.
-
-        Args:
-            response: WebSocket handshake response event to send.
-
-        """
-        if self.debug:
-            code, phrase = response.status_code, response.reason_phrase
-            self.logger.debug("> HTTP/1.1 %d %s", code, phrase)
-            for key, value in response.headers.raw_items():
-                self.logger.debug("> %s: %s", key, value)
-            if response.body is not None:
-                self.logger.debug("> [body] (%d bytes)", len(response.body))
-
-        self.writes.append(response.serialize())
-
-        if response.status_code == 101:
-            assert self.state is CONNECTING
-            self.state = OPEN
+        if path is None:
+            creating_server = loop.create_server(factory, host, port, **kwds)
         else:
-            self.send_eof()
-            self.parser = self.discard()
-            next(self.parser)  # start coroutine
+            creating_server = loop.create_unix_server(factory, path, **kwds)
 
-    def parse(self) -> Generator[None, None, None]:
-        if self.state is CONNECTING:
-            request = yield from Request.parse(self.reader.read_line)
+        # This is a coroutine object.
+        self._creating_server = creating_server
+        self.ws_server = ws_server
 
-            if self.debug:
-                self.logger.debug("< GET %s HTTP/1.1", request.path)
-                for key, value in request.headers.raw_items():
-                    self.logger.debug("< %s: %s", key, value)
+    @asyncio.coroutine
+    def __aenter__(self):
+        return (yield from self)
 
-            self.events.append(request)
+    @asyncio.coroutine
+    def __aexit__(self, exc_type, exc_value, traceback):
+        self.ws_server.close()
+        yield from self.ws_server.wait_closed()
 
-        yield from super().parse()
+    def __await__(self):
+        server = yield from self._creating_server
+        self.ws_server.wrap(server)
+        return self.ws_server
+
+    __iter__ = __await__
+
+
+def unix_serve(ws_handler, path, **kwargs):
+    """
+    Similar to :func:`serve()`, but for listening on Unix sockets.
+
+    This function calls the event loop's
+    :meth:`~asyncio.AbstractEventLoop.create_unix_server` method.
+
+    It is only available on Unix.
+
+    It's useful for deploying a server behind a reverse proxy such as nginx.
+
+    """
+    return serve(ws_handler, path=path, **kwargs)
+
+
+# Disable asynchronous context manager functionality only on Python < 3.5.1
+# because it doesn't exist on Python < 3.5 and asyncio.ensure_future didn't
+# accept arbitrary awaitables in Python 3.5; that was fixed in Python 3.5.1.
+if sys.version_info[:3] <= (3, 5, 0):                       # pragma: no cover
+    @asyncio.coroutine
+    def serve(*args, **kwds):
+        return Serve(*args, **kwds).__await__()
+    serve.__doc__ = Serve.__doc__
+
+else:
+    serve = Serve

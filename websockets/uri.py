@@ -1,108 +1,60 @@
-from __future__ import annotations
+"""
+The :mod:`websockets.uri` module implements parsing of WebSocket URIs
+according to `section 3 of RFC 6455`_.
 
-import dataclasses
+.. _section 3 of RFC 6455: http://tools.ietf.org/html/rfc6455#section-3
+
+"""
+
+import collections
 import urllib.parse
-from typing import Optional, Tuple
 
-from . import exceptions
-
-
-__all__ = ["parse_uri", "WebSocketURI"]
+from .exceptions import InvalidURI
 
 
-@dataclasses.dataclass
-class WebSocketURI:
+__all__ = ['parse_uri', 'WebSocketURI']
+
+WebSocketURI = collections.namedtuple(
+    'WebSocketURI', ['secure', 'host', 'port', 'resource_name', 'user_info'])
+WebSocketURI.__doc__ = """WebSocket URI.
+
+* ``secure`` is the secure flag
+* ``host`` is the lower-case host
+* ``port`` if the integer port, it's always provided even if it's the default
+* ``resource_name`` is the resource name, that is, the path and optional query
+* ``user_info`` is an ``(username, password)`` tuple when the URI contains
+  `User Information`_, else ``None``.
+
+.. _User Information: https://tools.ietf.org/html/rfc3986#section-3.2.1
+
+"""
+
+
+def parse_uri(uri):
     """
-    WebSocket URI.
+    This function parses and validates a WebSocket URI.
 
-    Attributes:
-        secure: :obj:`True` for a ``wss`` URI, :obj:`False` for a ``ws`` URI.
-        host: Normalized to lower case.
-        port: Always set even if it's the default.
-        path: May be empty.
-        query: May be empty if the URI doesn't include a query component.
-        username: Available when the URI contains `User Information`_.
-        password: Available when the URI contains `User Information`_.
+    If the URI is valid, it returns a :class:`WebSocketURI`.
 
-    .. _User Information: https://www.rfc-editor.org/rfc/rfc3986.html#section-3.2.1
-
-    """
-
-    secure: bool
-    host: str
-    port: int
-    path: str
-    query: str
-    username: Optional[str] = None
-    password: Optional[str] = None
-
-    @property
-    def resource_name(self) -> str:
-        if self.path:
-            resource_name = self.path
-        else:
-            resource_name = "/"
-        if self.query:
-            resource_name += "?" + self.query
-        return resource_name
-
-    @property
-    def user_info(self) -> Optional[Tuple[str, str]]:
-        if self.username is None:
-            return None
-        assert self.password is not None
-        return (self.username, self.password)
-
-
-# All characters from the gen-delims and sub-delims sets in RFC 3987.
-DELIMS = ":/?#[]@!$&'()*+,;="
-
-
-def parse_uri(uri: str) -> WebSocketURI:
-    """
-    Parse and validate a WebSocket URI.
-
-    Args:
-        uri: WebSocket URI.
-
-    Returns:
-        WebSocketURI: Parsed WebSocket URI.
-
-    Raises:
-        InvalidURI: if ``uri`` isn't a valid WebSocket URI.
+    Otherwise it raises an :exc:`~websockets.exceptions.InvalidURI` exception.
 
     """
-    parsed = urllib.parse.urlparse(uri)
-    if parsed.scheme not in ["ws", "wss"]:
-        raise exceptions.InvalidURI(uri, "scheme isn't ws or wss")
-    if parsed.hostname is None:
-        raise exceptions.InvalidURI(uri, "hostname isn't provided")
-    if parsed.fragment != "":
-        raise exceptions.InvalidURI(uri, "fragment identifier is meaningless")
-
-    secure = parsed.scheme == "wss"
-    host = parsed.hostname
-    port = parsed.port or (443 if secure else 80)
-    path = parsed.path
-    query = parsed.query
-    username = parsed.username
-    password = parsed.password
-    # urllib.parse.urlparse accepts URLs with a username but without a
-    # password. This doesn't make sense for HTTP Basic Auth credentials.
-    if username is not None and password is None:
-        raise exceptions.InvalidURI(uri, "username provided without password")
-
+    uri = urllib.parse.urlparse(uri)
     try:
-        uri.encode("ascii")
-    except UnicodeEncodeError:
-        # Input contains non-ASCII characters.
-        # It must be an IRI. Convert it to a URI.
-        host = host.encode("idna").decode()
-        path = urllib.parse.quote(path, safe=DELIMS)
-        query = urllib.parse.quote(query, safe=DELIMS)
-        if username is not None:
-            assert password is not None
-            username = urllib.parse.quote(username, safe=DELIMS)
-            password = urllib.parse.quote(password, safe=DELIMS)
+        assert uri.scheme in ['ws', 'wss']
+        assert uri.params == ''
+        assert uri.fragment == ''
+        assert uri.hostname is not None
+    except AssertionError as exc:
+        raise InvalidURI("{} isn't a valid URI".format(uri)) from exc
 
-    return WebSocketURI(secure, host, port, path, query, username, password)
+    secure = uri.scheme == 'wss'
+    host = uri.hostname
+    port = uri.port or (443 if secure else 80)
+    resource_name = uri.path or '/'
+    if uri.query:
+        resource_name += '?' + uri.query
+    user_info = None
+    if uri.username or uri.password:
+        user_info = (uri.username, uri.password)
+    return WebSocketURI(secure, host, port, resource_name, user_info)
